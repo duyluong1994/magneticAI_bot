@@ -3,8 +3,8 @@ import enum
 from datetime import datetime
 
 from config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
-from sqlalchemy import (Column, DateTime, Enum, ForeignKey, Numeric, String,
-                        Text, TypeDecorator, create_engine)
+from sqlalchemy import (Boolean, Column, DateTime, Enum, ForeignKey, Integer,
+                        Numeric, String, Text, TypeDecorator, create_engine)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
@@ -104,11 +104,49 @@ class Payment(Base):
 
 
 class User(Base):
-    """User model for updating totalPaidOut."""
+    """User model."""
     __tablename__ = 'Users'
 
     id = Column(UUID(as_uuid=False), primary_key=True)  # UUID stored as string
+    email = Column(String, nullable=False, unique=True)
+    currentEarnings = Column(Numeric(10, 2), default=0.00)
+    lifetimeEarnings = Column(Numeric(10, 2), default=0.00)
     totalPaidOut = Column(Numeric(10, 2), default=0.00)
+    isActive = Column(Boolean, default=True)
+    totalPhotosRated = Column(Integer, default=0)
+    photosRatedInCurrentBatch = Column(Integer, default=0)
+    ratingsInCurrentPeriod = Column(Integer, default=0)
+
+
+class Rating(Base):
+    """Rating model."""
+    __tablename__ = 'Ratings'
+
+    id = Column(UUID(as_uuid=False), primary_key=True)  # UUID stored as string
+    userId = Column(UUID(as_uuid=False), ForeignKey('Users.id'), nullable=False)
+    photoId = Column(UUID(as_uuid=False), ForeignKey('Photos.id'), nullable=False)
+    rating = Column(Integer, nullable=False)
+    timeInSeconds = Column(Integer, nullable=False)
+    startTime = Column(DateTime, nullable=False)
+    endTime = Column(DateTime, nullable=False)
+    earnings = Column(Numeric(10, 2), nullable=False, default=0.20)
+    createdAt = Column(DateTime, default=datetime.utcnow)
+    updatedAt = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Photo(Base):
+    """Photo model."""
+    __tablename__ = 'Photos'
+
+    id = Column(UUID(as_uuid=False), primary_key=True)  # UUID stored as string
+    imageUrl = Column(String, nullable=False)
+    batchId = Column(UUID(as_uuid=False), nullable=False)
+    isActive = Column(Boolean, default=True)
+    totalRatings = Column(Integer, default=0)
+    averageRating = Column(Numeric(3, 2), default=0.00)
+    createdAt = Column(DateTime, default=datetime.utcnow)
+    updatedAt = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    deletedAt = Column(DateTime, nullable=True)
 
 
 def get_db():

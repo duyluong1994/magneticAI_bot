@@ -4,8 +4,9 @@ import re
 
 from admin_manager import admin_manager
 from config import SYSADMIN_USER_ID, TELEGRAM_BOT_TOKEN
-from database import SessionLocal, get_db
+from database import Photo, Rating, SessionLocal, User, get_db
 from payment_service import complete_payments
+from sqlalchemy import func
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -79,6 +80,7 @@ Available commands:
         message += """
 Admin commands:
 /complete_payment <paymentIds> - Complete payment(s)
+/reset_unblock <user_email> <check_amount> - Reset user ratings and unblock
 /add_admin <user_id> - Add an admin (sysadmin only)
 /remove_admin <user_id> - Remove an admin (sysadmin only)
 /list_admins - List all admins (sysadmin only)
@@ -99,6 +101,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
   Complete one or more payments.
   Example: /complete_payment payment-id-1 payment-id-2 payment-id-3
   Or: /complete_payment payment-id-1
+
+/reset_unblock <user_email> <check_amount>
+  Reset the last X photos for a user, cancel earnings, and unblock the user.
+  Example: /reset_unblock test11@example.com 5
 
 /add_admin [@username]
   Add a sub-admin by username (sysadmin only).
@@ -347,6 +353,147 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(message)
 
 
+@require_admin
+async def reset_unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /reset_unblock command."""
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text(
+            "❌ Please provide user email and check amount.\n"
+            "Usage: /reset_unblock <user_email> <check_amount>\n"
+            "Example: /reset_unblock test11@example.com 5"
+        )
+        return
+    
+    user_email = context.args[0].strip()
+    try:
+        check_amount = int(context.args[1].strip())
+        if check_amount <= 0:
+            raise ValueError("check_amount must be positive")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid check_amount. Please provide a positive integer.\n"
+            "Usage: /reset_unblock <user_email> <check_amount>\n"
+            "Example: /reset_unblock test11@example.com 5"
+        )
+        return
+    
+    try:
+        # Get database session
+        db_gen = get_db()
+        db = next(db_gen)
+        
+        try:
+            # Step 1: Find user by email
+            user = db.query(User).filter(User.email == user_email).first()
+            if not user:
+                await update.message.reply_text(
+                    f"❌ User not found with email: {user_email}"
+                )
+                return
+            
+            user_id = user.id
+            
+            # Step 2: Get the list of affected photo IDs (last check_amount photos)
+            # Get photoIds grouped by photoId, ordered by MAX(startTime) DESC, limit check_amount
+            affected_photos_query = db.query(
+                Rating.photoId,
+                func.max(Rating.startTime).label('max_start_time')
+            ).filter(
+                Rating.userId == user_id
+            ).group_by(
+                Rating.photoId
+            ).order_by(
+                func.max(Rating.startTime).desc()
+            ).limit(check_amount).all()
+            
+            affected_photo_ids = [row.photoId for row in affected_photos_query]
+            
+            if not affected_photo_ids:
+                await update.message.reply_text(
+                    f"⚠️ No ratings found for user {user_email}. Nothing to reset."
+                )
+                return
+            
+            photo_count = len(affected_photo_ids)
+            
+            # Step 3: Calculate total earnings to subtract
+            total_earnings_to_subtract = db.query(
+                func.coalesce(func.sum(Rating.earnings), 0)
+            ).filter(
+                Rating.userId == user_id,
+                Rating.photoId.in_(affected_photo_ids),
+                Rating.earnings > 0
+            ).scalar() or 0
+            
+            # Step 4: Update user's fields
+            user.currentEarnings = max(0, user.currentEarnings - total_earnings_to_subtract)
+            user.lifetimeEarnings = max(0, user.lifetimeEarnings - total_earnings_to_subtract)
+            user.isActive = True
+            user.totalPhotosRated = max(0, user.totalPhotosRated - photo_count)
+            user.photosRatedInCurrentBatch = 0
+            user.ratingsInCurrentPeriod = 0
+            
+            # Step 5: Delete the ratings for the affected photos
+            deleted_count = db.query(Rating).filter(
+                Rating.userId == user_id,
+                Rating.photoId.in_(affected_photo_ids)
+            ).delete(synchronize_session=False)
+            
+            # Step 6: Recalculate totalRatings and averageRating for affected photos
+            for photo_id in affected_photo_ids:
+                photo = db.query(Photo).filter(Photo.id == photo_id).first()
+                if photo:
+                    # Recalculate totalRatings
+                    total_ratings = db.query(func.count(Rating.id)).filter(
+                        Rating.photoId == photo_id
+                    ).scalar() or 0
+                    
+                    # Recalculate averageRating
+                    avg_rating = db.query(func.avg(Rating.rating)).filter(
+                        Rating.photoId == photo_id
+                    ).scalar()
+                    
+                    photo.totalRatings = total_ratings
+                    photo.averageRating = avg_rating if avg_rating else 0.00
+            
+            # Commit all changes
+            db.commit()
+            
+            # Format response message
+            message = f"✅ Reset and unblocked user successfully!\n\n"
+            message += f"User: {user_email}\n"
+            message += f"User ID: {user_id}\n"
+            message += f"Photos affected: {photo_count}\n"
+            message += f"Earnings subtracted: ${total_earnings_to_subtract:.2f}\n"
+            message += f"Ratings deleted: {deleted_count}\n"
+            message += f"Affected photo IDs: {', '.join(affected_photo_ids[:5])}"
+            if len(affected_photo_ids) > 5:
+                message += f" ... and {len(affected_photo_ids) - 5} more"
+            
+            await update.message.reply_text(message)
+            logger.info(
+                f"Reset unblock: Deleted ratings for {photo_count} photos, "
+                f"subtracted ${total_earnings_to_subtract} from user {user_id}, "
+                f"affected_photo_ids: {affected_photo_ids}"
+            )
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error in reset_unblock_command: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"❌ An error occurred while resetting user: {str(e)}"
+            )
+        finally:
+            # Close database session
+            db.close()
+        
+    except Exception as e:
+        logger.error(f"Error in reset_unblock_command: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ An error occurred: {str(e)}"
+        )
+
+
 def main():
     """Start the bot."""
     if not TELEGRAM_BOT_TOKEN:
@@ -363,6 +510,7 @@ def main():
     application.add_handler(CommandHandler("add_admin", add_admin_command))
     application.add_handler(CommandHandler("remove_admin", remove_admin_command))
     application.add_handler(CommandHandler("list_admins", list_admins_command))
+    application.add_handler(CommandHandler("reset_unblock", reset_unblock_command))
     
     # Start the bot
     logger.info("Bot is starting...")
